@@ -18,7 +18,19 @@
  */
 
 const AdventureManager = game.def("com.bluebyte.tso.adventure.logic::AdventureManager").getInstance();
-const console = air.Introspector.Console;
+// Proxy so logging works whenever the Introspector is open, without requiring a restart.
+var console = (function () {
+    function forward(method, args) {
+        if (!air.Introspector) return;
+        air.Introspector.Console[method].apply(air.Introspector.Console, args);
+    }
+    return {
+        log:   function () { forward('log',   arguments); },
+        error: function () { forward('error', arguments); },
+        warn:  function () { forward('warn',  arguments); },
+        info:  function () { forward('info',  arguments); }
+    };
+}());
 // Global utility function for zero-padding numbers
 var lz = function (n) { return n < 10 ? '0' + n : n; };
 
@@ -270,7 +282,7 @@ const LIMITS = {
 };
 
 const SPECIALIST_TYPE = {
-    GENNERAL: 0,
+    GENERAL: 0,
     EXPLORER: 1,
     GEOLOGIST: 2
 }
@@ -800,6 +812,9 @@ const aQueue = {
             aUI.updateStatus("{0} Sending generals to Star {1}!!".format(args.file || "", args.order || ""), "Adventure");
         },
         moveGeneral: function (args) {
+            var spec = armyGetSpecialistFromID(args.id);
+            if (spec && typeof spec.GetGarrisonGridIdx === 'function' &&
+                spec.GetGarrisonGridIdx() <= 0 && typeof spec.SetTask === 'function') spec.SetTask(null);
             aAdventure.action.sendGeneralAction(args.id, 4, args.order || "");
             aUI.updateStatus("{0} Moving generals to position {1}!!".format(args.file || "", args.order || ""), "Adventure");
         },
@@ -1474,18 +1489,24 @@ const aUtils = {
                     aUI.Alert("{0} Island Loaded!".format(step.name === 'VisitAdventure' ? 'Adventure' : 'Home'), 'QUEST');
                     aSession.adventure.action = '';
 
-                    // Auto-inject WaitForDeparture step after VisitAdventure if missing
+                    // Only inject WaitForDeparture if the template explicitly includes StarGenerals.
+                    // Unconditional injection caused StarGenerals to fire on repeat runs using
+                    // stale battlePacket data from the previous run.
                     if (step.name === 'VisitAdventure') {
                         var nextStepIndex = aSession.adventure.index + 1;
                         var nextStep = aSession.adventure.steps[nextStepIndex];
-
-                        // If next step is not WaitForDeparture, inject it
-                        if (!nextStep || nextStep.name !== 'WaitForDeparture') {
+                        var hasStarGenerals = false;
+                        for (var si = nextStepIndex; si < aSession.adventure.steps.length; si++) {
+                            if (aSession.adventure.steps[si].name === 'StarGenerals') {
+                                hasStarGenerals = true;
+                                break;
+                            }
+                        }
+                        if (hasStarGenerals && nextStep && nextStep.name !== 'WaitForDeparture') {
                             aSession.adventure.steps.splice(nextStepIndex, 0, {
                                 name: 'WaitForDeparture',
                                 data: null
                             });
-                            console.info('Auto-injected WaitForDeparture step after VisitAdventure');
                         }
                     }
 
@@ -2850,6 +2871,7 @@ const aUI = {
                     aWindow.steps = [];
                     aWindow.steps.push({ name: 'VisitAdventure' });
                     aWindow.steps.push({ name: 'UseSpeedBuff' });
+                    aWindow.steps.push({ name: 'StarGenerals' });
                     $.each(aAdventure.data.getItems(value), function (k) {
                         aWindow.steps.push({ name: 'ProduceItem', data: k });
                         aWindow.steps.push({ name: 'ApplyBuff', data: k });
@@ -2878,6 +2900,7 @@ const aUI = {
                             $('<li>').html($('<a>', { 'href': '#', 'name': 'VisitAdventure' }).text("Load Adventure")),
                             $('<li>').html($('<a>', { 'href': '#', 'name': 'CollectPickups', 'class': 'venture_only' }).text("Collect Pickups")),
                             $('<li>').html($('<a>', { 'href': '#', 'name': 'AdventureTemplate' }).text("Adventure Template/s")),
+                            $('<li>').html($('<a>', { 'href': '#', 'name': 'StarGenerals' }).text("Star General/s")),
                         ])
                     ])
                 )
@@ -3008,6 +3031,48 @@ const aUI = {
                     aWindow.withBody(".remTable").css({ "background": "inherit", "margin-top": "5px" });
                     aWindow.show();
                     $('#aAdventure_SpeedBuffs').val(aSettings.defaults.Adventures.speedBuff);
+
+                    $('#aAdventureModal').one('shown.bs.modal', function () {
+                        var dialog = $('#aAdventureModal .modal-dialog');
+                        var dragging = false;
+                        var startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+                        dialog.find('.modal-header').css('cursor', 'move').on('mousedown', function (e) {
+                            dragging = true;
+                            startX = e.clientX;
+                            startY = e.clientY;
+                            var pos = dialog.offset();
+                            startLeft = pos.left;
+                            startTop = pos.top;
+                            // Pin the current width before switching to fixed positioning,
+                            // otherwise the dialog collapses to its content width.
+                            dialog.css({
+                                width: dialog.outerWidth(),
+                                position: 'fixed',
+                                left: startLeft,
+                                top: startTop,
+                                margin: '0',
+                                'margin-top': '0'
+                            });
+                            e.preventDefault();
+                        });
+
+                        // Clear any prior bindings first so handlers can't accumulate if a
+                        // previous open closed without firing hidden.bs.modal.
+                        $(document).off('.adventureDrag').on('mousemove.adventureDrag', function (e) {
+                            if (!dragging) return;
+                            dialog.css({
+                                left: startLeft + (e.clientX - startX),
+                                top: startTop + (e.clientY - startY)
+                            });
+                        }).on('mouseup.adventureDrag', function () {
+                            dragging = false;
+                        });
+
+                        $('#aAdventureModal').one('hidden.bs.modal', function () {
+                            $(document).off('mousemove.adventureDrag mouseup.adventureDrag');
+                        });
+                    });
                 } catch (e) { console.error(e); }
             },
             AM_LoadInfo: function () {
@@ -5913,13 +5978,16 @@ const aAdventure = {
                 $.each(battlePacket, function (id, general) {
                     if (!general.spec || general.spec.GetTask() || general.onSameGrid) return;
                     const order = "({0}/{1})".format(num++, allState.total);
-                    if (general.canSubmitMove) {
+                    var isInStar = general.spec.GetGarrisonGridIdx() <= 0;
+
+                    if (general.canSubmitMove || isInStar) {
                         if (general.grid > 0)
                             return aQueue.add('moveGeneral', { id: id, order: order });
-                        else
+                        if (!isInStar)
                             return aQueue.add('retranchGeneral', { id: id, order: order });
+                        return;
                     }
-                    if (landingFields.indexOf(general.grid) > -1 && general.spec.GetGarrisonGridIdx() > 0)
+                    if (landingFields.indexOf(general.grid) > -1 && !isInStar)
                         return aQueue.add('retranchGeneral', { id: id, order: order });
                 });
                 var message = null;
@@ -6345,20 +6413,12 @@ const aAdventure = {
          */
         starGenerals: function () {
             try {
+                var num = 1;
                 $.each(battlePacket, function (id) {
                     var spec = armyGetSpecialistFromID(id);
-                    if (!spec.GetGarrisonGridIdx()) return;
-                    auto.cycle.Queue.add(function () {
-                        try {
-                            game.gi.mCurrentCursor.mCurrentSpecialist = spec;
-                            var sTask = new armySpecTaskDef();
-                            sTask.uniqueID = spec.GetUniqueID();
-                            sTask.subTaskID = 0;
-                            game.gi.SendServerAction(95, 12, game.gi.mCurrentCursor.GetGridPosition(), 0, sTask);
-                            spec.SetTask(new armySpecTravelDef(game.gi, spec, 0, 12));
-                            aUI.updateStatus("Sending generals to Star ({0}/{1})!!".format(auto.cycle.Queue.index, auto.cycle.Queue.len() - 1));
-                        } catch (e) { }
-                    });
+                    if (!spec || spec.GetGarrisonGridIdx() <= 0 || spec.GetTask() || spec.IsInUse() || spec.isTravellingAway()) return;
+                    aQueue.add('retranchGeneral', { id: id, order: "({0}/{1})".format(num, Object.keys(battlePacket).length) });
+                    num++;
                 });
             } catch (er) { }
         },
@@ -6390,7 +6450,7 @@ const aAdventure = {
         assignAllUnitsToFinish: function (army) {
             try {
                 aUI.playSound('UnitProduced');
-                aSpecialists.getSpecialists(SPECIALIST_TYPE.GENNERAL).forEach(function (general) {
+                aSpecialists.getSpecialists(SPECIALIST_TYPE.GENERAL).forEach(function (general) {
                     if (general.GetTask() !== null) { return; }
                     const HasElite = general.GetArmy().HasEliteUnits();
                     var remainingCapacity = general.GetMaxMilitaryUnits() - general.GetArmy().GetUnitsCount();
@@ -6907,15 +6967,32 @@ const aAdventure = {
                     // Try to send them to star if battlePacket exists
                     try {
                         if (typeof battlePacket !== 'undefined' && battlePacket) {
-                            aDebug.log('adventure', 'StarGenerals: Battle packet exists, sending to star');
-                            aAdventure.action.starGenerals();
+                            // Check first — only star generals that haven't reached star yet.
+                            // GetGarrisonGridIdx() returns > 0 on the island, and -1 (or <= 0) when in star.
+                            // Use explicit > 0 to avoid treating -1 as truthy (not-in-star).
+                            var allInStar = true;
+                            $.each(battlePacket, function (id) {
+                                var spec = armyGetSpecialistFromID(id);
+                                // A general already in the star is returned as a VO without the
+                                // live Specialist methods — treat that as "in star".
+                                if (!spec || typeof spec.GetGarrisonGridIdx !== 'function') {
+                                    aDebug.log('adventure', 'StarGenerals: General', id, '- in star (no live spec)');
+                                    return;
+                                }
+                                var gridIdx = spec.GetGarrisonGridIdx();
+                                aDebug.log('adventure', 'StarGenerals: General', id, '- GarrisonGridIdx:', gridIdx);
+                                if (gridIdx > 0 && !spec.IsInUse() && !spec.isTravellingAway()) {
+                                    allInStar = false;
+                                    return false;
+                                }
+                            });
+                            aDebug.log('adventure', 'StarGenerals: All generals in star?', allInStar);
 
-                            // Check if they're busy traveling to star
-                            var busy = aAdventure.info.areGeneralsBusy(allSpecialists);
-                            aDebug.log('adventure', 'StarGenerals: Generals busy traveling?', busy);
-
-                            if (busy)
+                            if (!allInStar) {
+                                aDebug.log('adventure', 'StarGenerals: Battle packet exists, sending to star');
+                                aAdventure.action.starGenerals();
                                 return aAdventure.auto.result("Waiting for specialists to reach star", false, 2);
+                            }
                         } else {
                             aDebug.log('adventure', 'StarGenerals: No battle packet yet, generals will be positioned later');
                         }
@@ -6961,21 +7038,9 @@ const aAdventure = {
                         return aAdventure.auto.result("Waiting for all specialists to depart ({0}s remaining)".format(remaining), false, 2);
                     }
 
-                    // Wait complete - reset timer and inject StarGenerals step
+                    // Wait complete - reset timer and proceed to StarGenerals
                     aSession.adventure.starGeneralsStartTime = null;
-                    aDebug.log('adventure', 'WaitForDeparture: Wait complete, injecting StarGenerals step');
-
-                    // Inject StarGenerals step after this one
-                    var nextStepIndex = aSession.adventure.index + 1;
-                    var nextStep = aSession.adventure.steps[nextStepIndex];
-
-                    if (!nextStep || nextStep.name !== 'StarGenerals') {
-                        aSession.adventure.steps.splice(nextStepIndex, 0, {
-                            name: 'StarGenerals',
-                            data: null
-                        });
-                        console.info('WaitForDeparture: Injected StarGenerals step');
-                    }
+                    aDebug.log('adventure', 'WaitForDeparture: Wait complete');
 
                     return aAdventure.auto.result("Departure window complete", true, 2);
                 } catch (er) {
@@ -7168,6 +7233,13 @@ const aAdventure = {
 
                     aDebug.log('adventure', 'AdventureTemplate: Current action state =', aSession.adventure.action);
 
+                    // A wave with no attack targets (e.g. a restore/load-only wave that pulls
+                    // generals back out of star) reports zero attackers, so attackerState can't
+                    // drive the move/load phases. Fall back to the full general state in that case;
+                    // attack waves keep using attackerState unchanged.
+                    var moveLoadState = attackerState.total > 0 ? attackerState : allState;
+                    var loadAttackersOnly = attackerState.total > 0;
+
                     if (aSession.adventure.action === 'attacking') {
                         const enemies = aSession.adventure.getEnemies(true);
                         aDebug.log('adventure', 'AdventureTemplate: ATTACKING state - enemies remaining:', enemies.remaining, '/', enemies.all);
@@ -7182,14 +7254,14 @@ const aAdventure = {
                     }
 
                     if (aSession.adventure.action === "move") {
-                        aDebug.log('adventure', 'AdventureTemplate: MOVE phase - onGrid:', attackerState.grid.onGrid, ', totalOn:', attackerState.grid.totalOn, '/', attackerState.total);
-                        if (!attackerState.grid.onGrid &&
-                            attackerState.grid.totalOn < attackerState.total) {
+                        aDebug.log('adventure', 'AdventureTemplate: MOVE phase - onGrid:', moveLoadState.grid.onGrid, ', totalOn:', moveLoadState.grid.totalOn, '/', moveLoadState.total);
+                        if (!moveLoadState.grid.onGrid &&
+                            moveLoadState.grid.totalOn < moveLoadState.total) {
                             aDebug.log('adventure', 'AdventureTemplate: Attempting move operations');
-                            return aAdventure.battle.attemptMove(attackerState, allState);
+                            return aAdventure.battle.attemptMove(moveLoadState, allState);
                         }
-                        if (attackerState.grid.onGrid && attackerState.busy.travelling.length) {
-                            aDebug.log('adventure', 'AdventureTemplate: Attackers on grid but', attackerState.busy.travelling.length, 'still travelling, waiting');
+                        if (moveLoadState.grid.onGrid && moveLoadState.busy.travelling.length) {
+                            aDebug.log('adventure', 'AdventureTemplate: Generals on grid but', moveLoadState.busy.travelling.length, 'still travelling, waiting');
                             return aAdventure.auto.result();
                         }
                         aDebug.log('adventure', 'AdventureTemplate: MOVE complete, transitioning to LOAD');
@@ -7197,10 +7269,10 @@ const aAdventure = {
                     }
 
                     if (aSession.adventure.action === "load") {
-                        aDebug.log('adventure', 'AdventureTemplate: LOAD phase - army matched:', attackerState.army.matched);
-                        if (!attackerState.army.matched) {
+                        aDebug.log('adventure', 'AdventureTemplate: LOAD phase - army matched:', moveLoadState.army.matched);
+                        if (!moveLoadState.army.matched) {
                             aDebug.log('adventure', 'AdventureTemplate: Attempting load operations');
-                            return aAdventure.battle.attemptLoad(attackerState, true);
+                            return aAdventure.battle.attemptLoad(moveLoadState, loadAttackersOnly);
                         }
                         aDebug.log('adventure', 'AdventureTemplate: LOAD complete, transitioning to ATTACK');
                         aSession.adventure.action = "attack";
@@ -7389,7 +7461,7 @@ const aAdventure = {
 }
 
 const auto = {
-    version: '2.0.3',
+    version: '2.0.4-beta.4',
     developer: false,
     update: {
         apiUrl: 'https://api.github.com/repos/adly98/autoTSO/releases/latest',
